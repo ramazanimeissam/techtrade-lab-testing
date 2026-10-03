@@ -1,19 +1,33 @@
 #!/usr/bin/env bash
 # TechTrade-Labor PLAN-200: Rollenskript fuer die Linux-VMs.
-# Aufruf auf der jeweiligen VM (nachdem die Netzwerkkonfiguration gesetzt ist):
+# Aufruf auf der jeweiligen VM (mit temporaerer Adresse, siehe Anleitung):
 #   wget -qO- "$KIT_URL/setup.sh" | sudo KIT_URL="$KIT_URL" bash -s -- pc1|srv-web|srv-erp
 set -euo pipefail
 
 ROLE=${1:-}
-KIT_URL=${KIT_URL:?KIT_URL fehlt, z. B. https://raw.githubusercontent.com/<konto>/techtrade-lab/main}
+KIT_URL=${KIT_URL:-https://raw.githubusercontent.com/ramazanimeissam/techtrade-lab-testing/main}
 [[ $EUID -eq 0 ]] || { echo "Bitte mit sudo ausfuehren."; exit 1; }
 
 case "$ROLE" in
-  pc1)     HOST=PC1 ;;
-  srv-web) HOST=SRV-WEB ;;
-  srv-erp) HOST=SRV-ERP ;;
+  pc1)     HOST=PC1;     IP=10.10.10.11/24; GW=10.10.10.1; DNS=10.10.10.1 ;;
+  srv-web) HOST=SRV-WEB; IP=10.10.40.14/24; GW=10.10.40.1; DNS=10.10.40.1 ;;
+  srv-erp) HOST=SRV-ERP; IP=10.10.30.13/24; GW=10.10.30.1; DNS=10.10.30.1 ;;
   *) echo "Rolle fehlt: pc1 | srv-web | srv-erp"; exit 1 ;;
 esac
+
+echo "== $HOST: Netzwerk dauerhaft setzen (netplan)"
+rm -f /etc/netplan/*.yaml
+cat > /etc/netplan/01-techtrade.yaml <<EOF
+network:
+  version: 2
+  renderer: networkd
+  ethernets:
+    ens3:
+      addresses: [$IP]
+      routes: [{to: default, via: $GW}]
+      nameservers: {addresses: [$DNS]}
+EOF
+chmod 600 /etc/netplan/01-techtrade.yaml
 
 echo "== $HOST: Hostname und Anwendung"
 hostnamectl set-hostname "$HOST"
@@ -65,7 +79,8 @@ case "$ROLE" in
     ;;
 esac
 
-sleep 1
+netplan apply
+sleep 2
 echo "== Fertig: $HOST"
 ip -br -4 addr | grep -v '^lo'
 systemctl --no-pager --type=service --state=running | grep -E 'techtrade|iperf3' || true
