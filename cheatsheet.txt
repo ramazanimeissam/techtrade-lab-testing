@@ -1,0 +1,325 @@
+==============================================================================
+ TECHTRADE-LAB · CHEATSHEET · Lektion 10
+ Auftrag 1 Testkonzept Netz · Auftrag 2 E2E-Tests · Auftrag 3 Rollout Netz 50
+==============================================================================
+ Anzeigen:  less ~/cheatsheet.txt     (Suchen mit /Begriff, Ende mit q)
+            Beispiel: /NET-03  springt zu den Befehlen für NET-03
+ Für Nachweise immer mit Zeitstempel:   date
+
+------------------------------------------------------------------------------
+ ÜBERSICHT
+------------------------------------------------------------------------------
+ Host       Adresse                    Rolle                     Login
+ OPNsense   10.10.99.1 / 10.10.40.1    Edge-Firewall, NAT, DNS   root / Gns3456
+ R1         10.10.99.2 / .10.1 / .30.1 Core-Router, interne FW   vyos / Gns3456
+ PC1        10.10.10.11/24             Client, Testwerkzeuge     gns3 / Gns3456
+ PC2        (Netz 10.10.50.0/24)       neuer Client              gns3 / Gns3456
+ SRV-WEB    10.10.40.14/24             Shop :8080, iperf3 :5201  gns3 / Gns3456
+ SRV-ERP    10.10.30.13/24             ERP :9000, SQLite         gns3 / Gns3456
+
+ Namen:     shop.techtrade.lab = 10.10.40.14
+            erp.techtrade.lab  = 10.10.30.13
+ OPNsense-GUI (auf PC1 im Browser):  https://10.10.99.1
+
+ Produkte:  KB-01 Tastatur CH   Lager 25   CHF 79
+            MS-01 Maus          Lager 40   CHF 49
+            MO-27 Monitor 27"   Lager 8    CHF 349
+
+------------------------------------------------------------------------------
+ AUSGANGSZUSTAND FESTHALTEN (vor jedem Auftrag)
+------------------------------------------------------------------------------
+ R1        vyos@R1:~$ show version
+           vyos@R1:~$ sha256sum /config/config.boot
+ SRV-ERP   gns3@SRV-ERP:~$ cat /etc/os-release | grep PRETTY
+           gns3@SRV-ERP:~$ sha256sum /opt/techtrade/techtrade.py
+           gns3@SRV-ERP:~$ sudo techtrade inspect
+
+==============================================================================
+ AUFTRAG 1 · TESTKONZEPT NETZ
+==============================================================================
+
+ NET-02  Clientnetz erreicht auf SRV-ERP keinen TCP-/UDP-Port,
+         nur SRV-WEB erreicht SRV-ERP auf tcp/9000
+ ----------------------------------------------------------------------------
+ Negativtest:
+ gns3@PC1:~$ date
+ gns3@PC1:~$ nc -zv -w3 10.10.30.13 9000
+             Erwartet: ... timed out
+ gns3@PC1:~$ nmap -Pn -p 22,9000 10.10.30.13
+             Erwartet: 22/tcp filtered, 9000/tcp filtered
+ gns3@PC1:~$ ping -c 4 10.10.30.13
+             Erwartet: 0% packet loss (ICMP ist erlaubt)
+ Positivkontrolle:
+ gns3@SRV-WEB:~$ wget -qO- http://10.10.30.13:9000/health ; echo
+             Erwartet: {"service": "erp", "status": "up"}
+
+ NET-03  Namensauflösung aus dem Clientnetz in ≤ 50 ms
+ ----------------------------------------------------------------------------
+ gns3@PC1:~$ dig shop.techtrade.lab +stats
+             Erwartet: ANSWER 10.10.40.14, "Query time: x msec" (x ≤ 50)
+ gns3@PC1:~$ dig erp.techtrade.lab +stats
+             Erwartet: ANSWER 10.10.30.13, Query time ≤ 50 msec
+
+ NET-04  TCP-Throughput Clients → SRV-WEB ≥ 50 Mbit/s
+ ----------------------------------------------------------------------------
+ gns3@PC1:~$ iperf3 -c shop.techtrade.lab -t 10
+ gns3@PC1:~$ iperf3 -c shop.techtrade.lab -t 10
+ gns3@PC1:~$ iperf3 -c shop.techtrade.lab -t 10
+             Erwartet: Zeile "receiver" je Lauf; Mittelwert der 3 Läufe bilden
+
+ NET-05  RTT PC1 → SRV-WEB über 50 Pings: Mittel ≤ 5 ms, Max ≤ 20 ms,
+         Verlust 0 %
+ ----------------------------------------------------------------------------
+ gns3@PC1:~$ ping -c 50 -i 0.2 shop.techtrade.lab
+             Erwartet in den letzten Zeilen:
+             50 packets transmitted, 50 received, 0% packet loss
+             rtt min/avg/max/mdev = .../avg/max/... ms
+
+ NET-06  Verworfene Zugriffe Clientnetz → SRV-ERP werden auf R1
+         mit Zeit, Quelle, Ziel und Port protokolliert
+ ----------------------------------------------------------------------------
+ gns3@PC1:~$ date ; nc -zv -w3 10.10.30.13 9000
+ vyos@R1:~$ show log firewall
+             Erwartet: Eintrag mit SRC=10.10.10.11 DST=10.10.30.13 DPT=9000
+ vyos@R1:~$ show firewall ipv4 forward filter
+             Erwartet: Paketzähler von Regel 90 ist gestiegen
+ Zum Vergleich in OPNsense (GUI auf PC1):
+   Firewall > Log Files > Live View          Erwartet: kein Eintrag
+
+ NET-07  Firewallregeln auf R1 und OPNsense = Kommunikationsmatrix
+         (Inspektion)
+ ----------------------------------------------------------------------------
+ vyos@R1:~$ show configuration commands | match firewall
+ vyos@R1:~$ show firewall group
+ OPNsense (GUI auf PC1):
+   Firewall > Rules > LAN
+   Firewall > Rules > DMZ
+   Firewall > Aliases
+   Firewall > NAT > Outbound
+ Jede Regel mit einer Zeile der Kommunikationsmatrix vergleichen.
+
+==============================================================================
+ AUFTRAG 2 · END-TO-END-TESTS
+==============================================================================
+ X-Request-ID je Test neu wählen: Gruppe-Testnummer, z. B. g3-001, g3-002 ...
+
+ FA-01  Bestellung wird im ERP mit Lager, Bestellung, Rechnung gebucht
+ ----------------------------------------------------------------------------
+ gns3@SRV-ERP:~$ sudo techtrade inspect
+ gns3@PC1:~$ curl -s -i -X POST http://shop.techtrade.lab:8080/orders \
+               -H "Content-Type: application/json" -H "X-Request-ID: g3-001" \
+               -d '{"sku":"KB-01","qty":1,"customer":"Muster"}'
+             Erwartet: HTTP/1.0 201 Created, order_id, total_chf 79
+ gns3@SRV-ERP:~$ sudo techtrade inspect
+             Erwartet: KB-01 Lager −1, 1 Bestellung, 1 Rechnung CHF 79
+ gns3@SRV-WEB:~$ sudo journalctl -u techtrade-shop | grep g3-001
+ gns3@SRV-ERP:~$ sudo journalctl -u techtrade-erp | grep g3-001
+             Erwartet: je eine Zeile mit "status": 201
+
+ FA-02  Mengen ausserhalb 1–99 → HTTP 400; über Lagerbestand → HTTP 409;
+        in beiden Fällen keine Buchung
+ ----------------------------------------------------------------------------
+ gns3@SRV-ERP:~$ sudo techtrade inspect
+ gns3@PC1:~$ curl -s -i -X POST http://shop.techtrade.lab:8080/orders \
+               -H "Content-Type: application/json" -H "X-Request-ID: g3-010" \
+               -d '{"sku":"MS-01","qty":0,"customer":"Test"}'
+             Erwartet: 400
+ Den Befehl in dieser Reihenfolge wiederholen (jedes Mal neue X-Request-ID):
+   "qty":100      Erwartet: 400
+   "qty":"abc"    Erwartet: 400
+   "qty":41       Erwartet: 409 (MS-01 hat 40 Stück)
+   "qty":99       Erwartet: 409 (gültige Menge, Lager reicht nicht)
+   "qty":1        Erwartet: 201 (MS-01 danach 39)
+   "qty":39       Erwartet: 201 (genau der Restbestand, MS-01 danach 0)
+ gns3@SRV-ERP:~$ sudo techtrade inspect
+             Erwartet: Buchungen nur für die Fälle mit 201
+
+ PERF-01  Shop bestätigt eine Bestellung in ≤ 2 s
+ ----------------------------------------------------------------------------
+ gns3@PC1:~$ time curl -s -i -X POST http://shop.techtrade.lab:8080/orders \
+               -H "Content-Type: application/json" -H "X-Request-ID: g3-020" \
+               -d '{"sku":"KB-01","qty":1,"customer":"Muster"}'
+             Erwartet: HTTP 201, "real" deutlich unter 2 s
+ Zeit je Phase (vertikal):
+ gns3@PC1:~$ curl -s -o /dev/null -w "dns=%{time_namelookup} tcp=%{time_connect} total=%{time_total}\n" http://shop.techtrade.lab:8080/products
+ gns3@SRV-WEB:~$ time wget -qO- http://10.10.30.13:9000/products ; echo
+
+ INT-01  Jede Bestellung genau einmal gebucht, auch bei Wiederholung
+ ----------------------------------------------------------------------------
+ gns3@SRV-ERP:~$ sudo techtrade inspect
+ gns3@PC1:~$ curl -s -i -X POST http://shop.techtrade.lab:8080/orders \
+               -H "Content-Type: application/json" -H "X-Request-ID: g3-030" \
+               -d '{"sku":"KB-01","qty":1,"customer":"Muster"}'
+ gns3@PC1:~$ (genau denselben Befehl mit g3-030 nochmals senden: Pfeil hoch, Enter)
+ gns3@SRV-ERP:~$ sudo techtrade inspect
+ gns3@SRV-ERP:~$ sudo journalctl -u techtrade-erp | grep g3-030
+             Vergleichen: Wie viele Bestellungen und Rechnungen mit g3-030?
+
+ INT-02  Meldet der Shop "nicht bestätigt", entsteht im ERP keine Buchung
+ ----------------------------------------------------------------------------
+ gns3@SRV-ERP:~$ sudo techtrade inspect
+ gns3@SRV-ERP:~$ wget -qO- --post-data="" "http://127.0.0.1:9000/admin/delay?ms=3000" ; echo
+             Erwartet: {"delay_ms": 3000}
+ gns3@PC1:~$ time curl -s -i -X POST http://shop.techtrade.lab:8080/orders \
+               -H "Content-Type: application/json" -H "X-Request-ID: g3-040" \
+               -d '{"sku":"KB-01","qty":1,"customer":"Muster"}'
+             Beobachten: HTTP-Status und Meldung des Shops
+ gns3@SRV-ERP:~$ sleep 5 ; sudo techtrade inspect
+             Vergleichen: Gibt es eine Bestellung mit g3-040?
+ gns3@SRV-ERP:~$ wget -qO- --post-data="" "http://127.0.0.1:9000/admin/delay?ms=0" ; echo
+             Erwartet: {"delay_ms": 0}
+
+ AV-01  Bei ERP-Ausfall meldet der Shop den Fehler und läuft nach dem
+        Wiederanlauf ohne Eingriff weiter
+ ----------------------------------------------------------------------------
+ Terminal 1:
+ gns3@PC1:~$ techtrade probe
+ Terminal 2:
+ gns3@SRV-ERP:~$ sudo systemctl stop techtrade-erp
+ gns3@PC1:~$ curl -s -i -X POST http://shop.techtrade.lab:8080/orders \
+               -H "Content-Type: application/json" -H "X-Request-ID: g3-050" \
+               -d '{"sku":"KB-01","qty":1,"customer":"Muster"}'
+             Erwartet: HTTP 503 "ERP nicht erreichbar ..."
+ gns3@SRV-ERP:~$ sleep 20 ; sudo systemctl start techtrade-erp
+ Terminal 1: Ctrl+C
+             Erwartet: Zusammenfassung mit "laengster Unterbruch ... s",
+             danach wieder nur OK-Zeilen
+
+ Ausgangszustand herstellen
+ ----------------------------------------------------------------------------
+ gns3@SRV-ERP:~$ sudo systemctl stop techtrade-erp
+ gns3@SRV-ERP:~$ sudo techtrade reset
+ gns3@SRV-ERP:~$ sudo systemctl start techtrade-erp
+
+==============================================================================
+ AUFTRAG 3 · ROLLOUT NETZ 10.10.50.0/24 IM BETRIEB
+==============================================================================
+
+ SCHRITT 1 · MESSEN  (eigenes Terminal, läuft bis zum Schluss)
+ ----------------------------------------------------------------------------
+ gns3@PC1:~$ techtrade probe
+
+ SCHRITT 2 · SICHERN
+ ----------------------------------------------------------------------------
+ vyos@R1:~$ configure
+ vyos@R1# save /config/vor-netz50.config
+ vyos@R1# exit
+ vyos@R1:~$ sha256sum /config/vor-netz50.config
+ OPNsense (GUI auf PC1):
+   System > Configuration > Backups > Download configuration
+
+ SCHRITT 3 · RÜCKFALL PROBEN (Rückfallart reboot)
+ ----------------------------------------------------------------------------
+ vyos@R1:~$ configure
+ vyos@R1# set interfaces ethernet eth3 address 10.10.50.1/24
+ vyos@R1# commit-confirm 2
+          ... 2 Minuten warten, NICHT bestätigen ...
+          R1 startet neu. Messreihe auf PC1 beobachten.
+ vyos@R1:~$ show interfaces
+             Erwartet: eth3 wieder ohne Adresse
+ Unterbruch aus der Messreihe notieren = Rückfalldauer bei reboot.
+
+ SCHRITT 4 · RÜCKFALLART AUF RELOAD UMSTELLEN UND WIEDERHOLEN
+ ----------------------------------------------------------------------------
+ vyos@R1:~$ configure
+ vyos@R1# set system config-management commit-confirm action reload
+ vyos@R1# commit
+ vyos@R1# save
+ vyos@R1# exit
+ Danach Schritt 1 bis 3 wiederholen und die Unterbrüche vergleichen.
+
+ SCHRITT 5 · OPNSENSE VORBEREITEN (GUI auf PC1: https://10.10.99.1)
+ ----------------------------------------------------------------------------
+ Rückroute:
+   System > Routes > Configuration > +
+     Network Address:  10.10.50.0/24
+     Gateway:          GW_R1
+     Description:      Netz 50 via R1
+   Save > Apply
+ Alias:
+   Firewall > Aliases > NET_CLIENTS (Stift)
+     Content: 10.10.50.0/24 ergänzen
+   Save > Apply
+ Messreihe auf PC1 weiterhin nur OK?
+
+ SCHRITT 6 · R1 ÄNDERN
+ ----------------------------------------------------------------------------
+ vyos@R1:~$ configure
+ vyos@R1# set interfaces ethernet eth3 address 10.10.50.1/24
+ vyos@R1# set firewall group network-group NET-CLIENTS network 10.10.50.0/24
+ vyos@R1# set service dns forwarding listen-address 10.10.50.1
+ vyos@R1# compare
+             Erwartet: genau diese drei Zeilen neu
+ vyos@R1# commit-confirm 5
+             Jetzt 5 Minuten Zeit für Schritt 7 und 8, sonst Rückfall.
+ vyos@R1# run show interfaces
+             Erwartet: eth3  10.10.50.1/24  u/u
+
+ SCHRITT 7 · PC2 KONFIGURIEREN
+ ----------------------------------------------------------------------------
+ gns3@PC2:~$ sudo nano /etc/netplan/01-networkd.yaml
+   Inhalt ersetzen durch:
+   network:
+     version: 2
+     renderer: networkd
+     ethernets:
+       ens3:
+         dhcp4: false
+         addresses: [10.10.50.11/24]
+         routes: [{to: default, via: 10.10.50.1}]
+         nameservers: {addresses: [10.10.50.1]}
+   Speichern Ctrl+O, Enter, Ende Ctrl+X
+ gns3@PC2:~$ sudo netplan apply
+ gns3@PC2:~$ ip -br addr
+             Erwartet: ens3  UP  10.10.50.11/24
+
+ SCHRITT 8 · PRÜFEN
+ ----------------------------------------------------------------------------
+ gns3@PC2:~$ ping -c 4 10.10.50.1
+             Erwartet: 0% packet loss
+ gns3@PC2:~$ getent hosts shop.techtrade.lab
+             Erwartet: 10.10.40.14  shop.techtrade.lab
+ gns3@PC2:~$ wget -qO- http://shop.techtrade.lab:8080/health ; echo
+             Erwartet: {"service": "shop", "status": "up"}
+ gns3@PC2:~$ wget -T 3 -t 1 -qO- http://10.10.30.13:9000/health ; echo
+             Erwartet: keine Ausgabe nach 3 s (gesperrt)
+ gns3@SRV-WEB:~$ wget -qO- http://10.10.30.13:9000/health ; echo
+             Erwartet: {"service": "erp", "status": "up"} (Positivkontrolle)
+ gns3@PC2:~$ ping -c 4 1.1.1.1
+             Erwartet: 0% packet loss
+ vyos@R1# run show log firewall
+             Erwartet: gesperrter Zugriff 10.10.50.11 → 10.10.30.13:9000
+ Schlägt eine Prüfung fehl: Firewall > Log Files > Live View (OPNsense)
+ und "run show log firewall" (R1) zeigen, wo das Paket hängen bleibt.
+
+ SCHRITT 9 · ABNEHMEN
+ ----------------------------------------------------------------------------
+ vyos@R1# confirm
+ vyos@R1# save
+ vyos@R1# exit
+ vyos@R1:~$ show configuration commands | match 10.10.50
+             Erwartet: Adresse eth3, Gruppe NET-CLIENTS, DNS listen-address
+ PC1, Terminal mit der Messreihe: Ctrl+C
+             Erwartet: laengster Unterbruch ≤ 5 s
+
+ RÜCKFALL (falls nötig)
+ ----------------------------------------------------------------------------
+ R1, vor "confirm":   nichts tun, nach Ablauf lädt R1 den alten Stand
+ R1, nach "save":     vyos@R1:~$ configure
+                      vyos@R1# load /config/vor-netz50.config
+                      vyos@R1# commit
+                      vyos@R1# save
+ OPNsense:            System > Configuration > History > Stand vor dem Umbau
+                      wiederherstellen
+
+==============================================================================
+ ALLGEMEIN
+==============================================================================
+ Terminal-Tipps
+   Ctrl+C       laufenden Befehl beenden
+   Ctrl+R       frühere Befehle suchen
+   Pfeil hoch   letzten Befehl wiederholen
+   Tab          Befehle und Namen vervollständigen (auch in VyOS)
+   \            am Zeilenende: Befehl auf der nächsten Zeile fortsetzen
+   run ...      in VyOS: Betriebsbefehl im Konfigurationsmodus ausführen
+==============================================================================
