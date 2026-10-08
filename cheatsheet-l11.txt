@@ -1,0 +1,238 @@
+=====================================================================
+ PLAN-200 · Lektion 11 · Cheatsheet (Lösungsweg)
+ DHCP reparieren · Reverse Proxy ändern · Tests in Kiwi TCMS
+=====================================================================
+ Jeder Befehl steht unter dem System, auf dem er ausgeführt wird.
+ Zeilen mit # sind Erklärungen und werden nicht eingegeben.
+
+
+---------------------------------------------------------------------
+ AUSGANGSZUSTAND ERFASSEN
+---------------------------------------------------------------------
+[R1]
+show version | match Version
+
+[SRV-INFRA]
+lsb_release -d
+kea-dhcp4 -v
+sha256sum /etc/kea/kea-dhcp4.conf
+
+[SRV-PROXY]
+nginx -v
+sha256sum /etc/nginx/sites-available/shop
+
+[SRV-WEB]
+systemctl is-active techtrade-shop techtrade-shop-b
+
+
+---------------------------------------------------------------------
+ DHCP IM NETZ 50 REPARIEREN
+---------------------------------------------------------------------
+# Eingrenzen von aussen nach innen: Client -> Relay -> Server
+
+[PC2]
+ip -4 addr show ens3                 # keine IPv4-Adresse
+sudo networkctl reconfigure ens3     # neue Anfrage auslösen
+
+[R1]
+sudo tcpdump -ni eth3 -c 6 port 67 or port 68
+# DISCOVER von PC2 kommen an -> Client und Kabel sind in Ordnung
+
+[SRV-INFRA]
+sudo tcpdump -vni ens3 -c 6 port 67
+# DISCOVER kommen vom Relay 10.10.30.1 an, Gateway-IP (giaddr) 10.10.50.1
+# Es geht KEIN OFFER zurück -> Problem liegt beim DHCP-Server
+
+journalctl -u kea-dhcp4-server -n 40 --no-pager
+# Befund 1: "No subnet matches relay address: 10.10.50.1"
+#           "failed to select a subnet for incoming packet"
+
+cat /etc/kea/kea-dhcp4.conf
+# Befund 1: "subnet": "10.10.5.0/24" und Pool 10.10.5.100 - 10.10.5.199
+#           -> passt nicht zum Netz 10.10.50.0/24 (ANF-NET-01)
+# Befund 2: "domain-name-servers": "10.10.30.53"
+#           -> verlangt ist 10.10.50.1 (ANF-NET-02)
+#           Dieser Fehler fällt erst auf, wenn PC2 eine Adresse hat.
+
+# Rückfallpunkt setzen, dann ändern
+sudo cp /etc/kea/kea-dhcp4.conf /etc/kea/kea-dhcp4.conf.bak
+sudo nano /etc/kea/kea-dhcp4.conf
+
+# Korrekte Werte:
+#   "data": "10.10.50.1"                          (domain-name-servers)
+#   "subnet": "10.10.50.0/24",
+#   "pools": [ { "pool": "10.10.50.100 - 10.10.50.199" } ],
+
+sudo kea-dhcp4 -t /etc/kea/kea-dhcp4.conf      # Syntax prüfen
+sudo systemctl restart kea-dhcp4-server
+diff /etc/kea/kea-dhcp4.conf.bak /etc/kea/kea-dhcp4.conf
+
+[PC2]
+sudo networkctl reconfigure ens3
+ip -4 addr show ens3                 # 10.10.50.1xx, valid_lft endlich
+ip route                             # default via 10.10.50.1
+resolvectl status ens3               # DNS 10.10.50.1, Domain techtrade.lab
+dig +short shop.techtrade.lab
+curl -s http://shop.techtrade.lab:8080/health
+
+
+---------------------------------------------------------------------
+ DHCP-TESTFäLLE (Vorschlag)
+---------------------------------------------------------------------
+TC-DHCP-01  Lease aus dem Pool (ANF-NET-01, -03)
+  [PC2]       sudo networkctl reconfigure ens3 ; ip -4 addr show ens3
+  [SRV-INFRA] grep 10.10.50 /var/lib/kea/kea-leases4.csv
+  OK wenn: Adresse .100-.199, valid_lft endlich, gleiche IP+MAC im Lease-Bestand
+
+TC-DHCP-02  Gateway, DNS, Domäne (ANF-NET-02)
+  [PC2] ip route ; resolvectl status ens3
+  OK wenn: default via 10.10.50.1, DNS 10.10.50.1, Domain techtrade.lab
+
+TC-DHCP-03  Shop über den Namen erreichbar (ANF-NET-04)
+  [PC2] dig +short shop.techtrade.lab ; curl -s http://shop.techtrade.lab:8080/health
+  OK wenn: Name wird aufgelöst, Antwort {"service": "shop", "status": "up"}
+
+TC-DHCP-04  Negativtest: kein DHCP im Clientnetz 10 (ANF-NET-05)
+  [PC1] sudo nmap --script broadcast-dhcp-discover -e ens3
+  OK wenn: kein DHCP-Server antwortet
+
+TC-DHCP-05  Erneuerung bei T1 (ANF-NET-06)
+  [PC2] sudo tcpdump -ni ens3 port 67 or port 68
+  # 5 Minuten nach der Vergabe sendet PC2 ein REQUEST als Unicast direkt
+  # an SRV-INFRA (10.10.30.12), SRV-INFRA antwortet mit ACK.
+  OK wenn: REQUEST und ACK rund 300 s nach der letzten Vergabe
+
+
+---------------------------------------------------------------------
+ REVERSE PROXY äNDERN (CHANGE «SHOP NUR üBER HTTPS»)
+---------------------------------------------------------------------
+# Reihenfolge: Proxy konfigurieren und lokal prüfen -> Firewalls ->
+# Test über IP -> Namen umstellen -> Test über Namen
+# Rückfallpunkte: shop.bak auf SRV-PROXY, alte DNS-Adresse 10.10.40.14
+
+[SRV-PROXY]
+sudo cp /etc/nginx/sites-available/shop /etc/nginx/sites-available/shop.bak
+sudo nano /etc/nginx/sites-available/shop
+
+# ---- Inhalt /etc/nginx/sites-available/shop (Lösung) ----
+upstream shop_backend {
+    server 10.10.40.14:8080 weight=2;   # shop-a, aktuelle Version
+    server 10.10.40.14:8081 weight=1;   # shop-b, neue Version (Canary)
+}
+
+server {
+    listen 80;
+    server_name shop.techtrade.lab;
+    return 301 https://$host$request_uri;   # dauerhafte Umleitung
+}
+
+server {
+    listen 443 ssl;
+    server_name shop.techtrade.lab;
+
+    ssl_certificate     /etc/nginx/ssl/shop.crt;
+    ssl_certificate_key /etc/nginx/ssl/shop.key;
+
+    location / {
+        proxy_pass http://shop_backend;
+        proxy_set_header Host              $host;
+        proxy_set_header X-Real-IP         $remote_addr;
+        proxy_set_header X-Forwarded-For   $proxy_add_x_forwarded_for;
+        proxy_set_header X-Forwarded-Proto $scheme;
+    }
+}
+# ---- Ende ----
+
+sudo nginx -t
+sudo systemctl reload nginx
+sudo ss -tlnp | grep nginx                       # :80 und :443
+curl -sk -D - -o /dev/null https://127.0.0.1/health
+
+[R1]   Firewall 1: Clients -> SRV-PROXY 80/443, kein direkter Zugriff auf 8080
+configure
+set firewall group address-group SRV-PROXY address '10.10.40.10'
+set firewall ipv4 forward filter rule 21 action 'accept'
+set firewall ipv4 forward filter rule 21 description 'Clients -> Reverse Proxy'
+set firewall ipv4 forward filter rule 21 protocol 'tcp'
+set firewall ipv4 forward filter rule 21 source group network-group 'NET-CLIENTS'
+set firewall ipv4 forward filter rule 21 destination group address-group 'SRV-PROXY'
+set firewall ipv4 forward filter rule 21 destination port '80,443'
+delete firewall group port-group PORTS-SHOP port '8080'
+commit-confirm 5
+confirm
+save
+exit
+
+[OPNsense GUI https://10.10.99.1]   Firewall 2
+  Firewall > Aliases:
+    neu  SRV_PROXY  Typ Host(s)  10.10.40.10
+    neu  PORTS_RP   Typ Port(s)  80 443
+    PORTS_SHOP: 8080 entfernen (5201 bleibt)          -> Save, Apply
+  Firewall > Rules > LAN:
+    neu  Pass, Protocol TCP, Source NET_CLIENTS,
+         Destination SRV_PROXY, Destination port range PORTS_RP  -> Save, Apply
+
+[PC1]   Test über die IP, bevor der Name umgestellt wird
+curl -sk -D - -o /dev/null https://10.10.40.10/health
+
+[R1]   Umstellung des Namens (Cutover)
+show configuration commands | match shop
+configure
+set service dns forwarding authoritative-domain techtrade.lab records a shop address '10.10.40.10'
+delete service dns forwarding authoritative-domain techtrade.lab records a shop address '10.10.40.14'
+commit-confirm 5
+confirm
+save
+exit
+
+[PC1]
+resolvectl flush-caches                 # alter Eintrag kann noch im Cache sein
+dig +short shop.techtrade.lab           # 10.10.40.10
+curl -sk -D - -o /dev/null https://shop.techtrade.lab/health   # 200
+curl -s  -D - -o /dev/null http://shop.techtrade.lab/health    # 301, Location https://...
+curl -s -m 3 -o /dev/null -w '%{http_code}\n' http://10.10.40.14:8080/health   # 000 (gesperrt)
+
+[SRV-WEB]
+journalctl -u techtrade-shop -n 5 --no-pager
+# "client": "10.10.40.10" (der Proxy), "xff": "10.10.10.11", "proto": "https"
+
+
+---------------------------------------------------------------------
+ REVERSE-PROXY-TESTFÄLLE (Vorschlag)
+---------------------------------------------------------------------
+TC-RP-01  HTTP -> HTTPS (ANF-RP-02)
+  [PC1] curl -sI http://shop.techtrade.lab/products
+  [SRV-PROXY] sudo tail -n 1 /var/log/nginx/access.log
+  OK wenn: 301, Location https://shop.techtrade.lab/products, Eintrag mit 10.10.10.11
+
+TC-RP-02  HTTPS über den Namen (ANF-RP-01)
+  [PC1] dig +short shop.techtrade.lab ; curl -sk -o /dev/null -w '%{http_code}\n' https://shop.techtrade.lab/products
+  OK wenn: 10.10.40.10 und 200
+
+TC-RP-03  Client-IP und Protokoll beim Shop (ANF-RP-03)
+  [PC1] curl -sk https://shop.techtrade.lab/health
+  [SRV-WEB] journalctl -u techtrade-shop -u techtrade-shop-b -n 2 --no-pager
+  OK wenn: xff = 10.10.10.11, proto = https
+
+TC-RP-04  Verteilung 2 : 1 (ANF-RP-04)
+  [PC1] for i in $(seq 30); do curl -sk -D - -o /dev/null https://shop.techtrade.lab/health | grep -i x-served-by; done | sort | uniq -c
+  OK wenn: 20 x shop-a, 10 x shop-b
+
+TC-RP-05  Ausfall einer Instanz (ANF-RP-05)
+  [SRV-WEB] sudo systemctl stop techtrade-shop-b
+  [PC1]     30 Anfragen wie TC-RP-04
+  [SRV-WEB] sudo systemctl start techtrade-shop-b
+  OK wenn: 30 x 200, alle shop-a
+  Plausibilisieren: beide Instanzen laufen auf SRV-WEB -> bewiesen ist der
+  Ausfall eines Prozesses, nicht der Ausfall eines Servers.
+
+TC-RP-06  Negativtest: kein Direktzugriff (ANF-RP-06)
+  [PC1] curl -s -m 3 -o /dev/null -w '%{http_code}\n' http://10.10.40.14:8080/health
+  [PC1] curl -s -m 3 -o /dev/null -w '%{http_code}\n' http://10.10.40.14:8081/health
+  OK wenn: beide 000 (Timeout)
+  Positivkontrolle: [SRV-PROXY] curl -s http://10.10.40.14:8080/health -> antwortet
+
+Beide Instanzen gestoppt:
+  [PC1] -> 502 Bad Gateway
+  [SRV-PROXY] sudo tail -n 3 /var/log/nginx/error.log
+  -> connect() failed (111: Connection refused) ... / no live upstreams
