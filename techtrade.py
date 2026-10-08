@@ -25,6 +25,7 @@ ERP_URL = os.environ.get("ERP_URL", "http://10.10.30.13:9000")
 ERP_TIMEOUT = float(os.environ.get("ERP_TIMEOUT", "2"))
 PRODUCTS = [("KB-01", "Tastatur CH", 25, 79), ("MS-01", "Maus", 40, 49), ("MO-27", "Monitor 27 Zoll", 8, 349)]
 STATE = {"delay_ms": 0}
+INSTANCE = os.environ.get("INSTANCE", "")
 
 
 # ---------------------------------------------------------------- ERP-Datenhaltung
@@ -116,11 +117,13 @@ def make_handler(role):
             self.send_header("Content-Type", ctype + "; charset=utf-8")
             self.send_header("Content-Length", str(len(body)))
             self.send_header("X-Request-ID", self.rid)
-            self.send_header("X-Served-By", role)
+            self.send_header("X-Served-By", INSTANCE or role)
             self.end_headers()
             self.wfile.write(body)
-            print(json.dumps({"ts": datetime.datetime.now().isoformat(timespec="seconds"), "svc": role,
+            print(json.dumps({"ts": datetime.datetime.now().isoformat(timespec="seconds"), "svc": INSTANCE or role,
                               "request_id": self.rid, "client": self.client_address[0],
+                              "xff": self.headers.get("X-Forwarded-For", "-"),
+                              "proto": self.headers.get("X-Forwarded-Proto", "-"),
                               "method": self.command, "path": self.path, "status": status,
                               "ms": round((time.time() - self.t0) * 1000, 1)}), flush=True)
 
@@ -222,7 +225,7 @@ def main():
     a = p.parse_args()
 
     if a.cmd == "serve":
-        port = 8080 if a.role == "shop" else 9000
+        port = int(os.environ.get("PORT", 8080 if a.role == "shop" else 9000))
         if a.role == "erp":
             init_db()
         print(f"{a.role} hoert auf 0.0.0.0:{port}", flush=True)
